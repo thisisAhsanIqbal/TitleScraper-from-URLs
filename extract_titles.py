@@ -94,7 +94,7 @@ def main():
         asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
     # Get the domain name from the first URL in the file
-    with open('celebrationsathomeblog.com_post_urls.txt', 'r', encoding='utf-8') as f:
+    with open('urls.txt', 'r', encoding='utf-8') as f:
         first_url = f.readline().strip()
         domain = urlparse(first_url).netloc
         domain = domain.replace('www.', '')
