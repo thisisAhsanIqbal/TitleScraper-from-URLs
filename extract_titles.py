@@ -22,38 +22,52 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Timeout and concurrency settings
-TIMEOUT = ClientTimeout(total=10)
+TIMEOUT = ClientTimeout(total=25)
 MAX_CONCURRENT_REQUESTS = 50
 CHUNK_SIZE = 1000
 
-async def get_page_title(session: aiohttp.ClientSession, url: str) -> Dict:
-    try:
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-            'Accept-Language': 'en-US,en;q=0.5',
-            'Connection': 'keep-alive',
-        }
-        
-        async with session.get(url, headers=headers, timeout=TIMEOUT) as response:
-            if response.status != 200:
-                return {'URL': url, 'Title': f"Error: HTTP {response.status}"}
-            
-            html = await response.text(encoding='utf-8', errors='ignore')
-            soup = BeautifulSoup(html, 'html.parser')
+async def get_page_title(session: aiohttp.ClientSession, url: str, retries: int = 3) -> Dict:
+    for attempt in range(1, retries + 1):
+        try:
+            headers = {
+                'authority': urlparse(url).netloc,
+                'accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8',
+                'accept-language': 'en-US,en;q=0.9',
+                'cache-control': 'no-cache',
+                'pragma': 'no-cache',
+                'sec-fetch-dest': 'document',
+                'sec-fetch-mode': 'navigate',
+                'sec-fetch-site': 'none',
+                'sec-fetch-user': '?1',
+                'upgrade-insecure-requests': '1',
+                'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+            }
 
-            h1 = soup.find('h1')
-            if h1 and h1.text.strip():
-                return {'URL': url, 'Title': h1.text.strip()}
-            
-            title = soup.find('title')
-            if title and title.text.strip():
-                return {'URL': url, 'Title': title.text.strip()}
-            
-            return {'URL': url, 'Title': "No title found"}
-            
-    except Exception as e:
-        return {'URL': url, 'Title': f"Error: {str(e)}"}
+            async with session.get(url, headers=headers, timeout=TIMEOUT) as response:
+                if response.status != 200:
+                    if 500 <= response.status < 600 and attempt < retries:
+                        continue  # Retry on 5xx server errors
+                    if 400 <= response.status < 500 and attempt < retries:
+                        continue  # Retry on 4xx errors like 403, 404
+                    return {'URL': url, 'Title': f"Error: HTTP {response.status}"}
+
+                html = await response.text(encoding='utf-8', errors='ignore')
+                soup = BeautifulSoup(html, 'html.parser')
+
+                h1 = soup.find('h1')
+                if h1 and h1.text.strip():
+                    return {'URL': url, 'Title': h1.text.strip()}
+
+                title = soup.find('title')
+                if title and title.text.strip():
+                    return {'URL': url, 'Title': title.text.strip()}
+
+                return {'URL': url, 'Title': "No title found"}
+
+        except Exception as e:
+            if attempt == retries:
+                return {'URL': url, 'Title': f"Error: {str(e)}"}
+            await asyncio.sleep(1)  # Wait before retry
 
 async def process_url_chunk(urls: List[str]) -> List[Dict]:
     connector = aiohttp.TCPConnector(limit=MAX_CONCURRENT_REQUESTS, force_close=True)
@@ -61,17 +75,50 @@ async def process_url_chunk(urls: List[str]) -> List[Dict]:
         tasks = [get_page_title(session, url) for url in urls]
         return await asyncio.gather(*tasks)
 
+
 async def process_all_urls(urls: List[str]) -> List[Dict]:
     results = []
     chunks = [urls[i:i + CHUNK_SIZE] for i in range(0, len(urls), CHUNK_SIZE)]
-    
+
+    success_count = 0
+    error_4xx = 0
+    error_5xx = 0
+    other_errors = 0
+
     with tqdm(total=len(urls), desc="🔎 Scraping URLs") as pbar:
         for chunk in chunks:
-            chunk_results = await process_url_chunk(chunk)
-            results.extend(chunk_results)
-            pbar.update(len(chunk))
-    
+            connector = aiohttp.TCPConnector(limit=MAX_CONCURRENT_REQUESTS, force_close=True)
+            async with aiohttp.ClientSession(connector=connector) as session:
+                tasks = [get_page_title(session, url) for url in chunk]
+                chunk_results = await asyncio.gather(*tasks)
+
+                for result in chunk_results:
+                    title = result['Title']
+                    if title.startswith("Error: HTTP"):
+                        try:
+                            code = int(title.split()[2])
+                        except:
+                            code = 0
+                        
+                        if 400 <= code < 500:
+                            error_4xx += 1
+                        elif 500 <= code < 600:
+                            error_5xx += 1
+                        else:
+                            other_errors += 1
+                    elif title.startswith("Error:"):
+                        other_errors += 1
+                    else:
+                        success_count += 1
+
+                    results.append(result)
+
+                pbar.update(len(chunk))
+
+                tqdm.write(f"✅ Success: {success_count} | ❌ 4xx: {error_4xx} | 🔥 5xx: {error_5xx} | ⚡ Other: {other_errors}")
+
     return results
+
 
 def save_to_excel(df: pd.DataFrame, output_path: str) -> str:
     """Save DataFrame to Excel with a timestamp."""
